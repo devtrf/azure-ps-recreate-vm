@@ -43,23 +43,23 @@ State is persisted to a local `.resize.state.json` file after each step. If the 
 | `-WhatIf` | | Preview actions without making changes |
 
 Default names are derived from the VM name and target size slug, e.g.:
-- Snapshot: `vmtest-os-snap-standard-d4ds-v5`
-- New OS disk: `vmtest-osdisk-standard-d4ds-v5`
-- State file: `.\tfvmex-resources-vmtest-standard-d4ds-v5.resize.state.json`
+- Snapshot: `<vm-name>-os-snap-standard-d4ds-v5`
+- New OS disk: `<vm-name>-osdisk-standard-d4ds-v5`
+- State file: `.\<resource-group>-<vm-name>-standard-d4ds-v5.resize.state.json`
 
 ## Usage
 
 **Basic — interactive confirmation:**
 ```powershell
-.\Resize-VmTempDisk.ps1 -ResourceGroupName tfvmex-resources -VMName vmtest -NewSize Standard_D4ds_v5
+.\Resize-VmTempDisk.ps1 -ResourceGroupName <resource-group> -VMName <vm-name> -NewSize Standard_D4ds_v5
 ```
 
 **With subscription selection, skip confirmation, and snapshot cleanup:**
 ```powershell
 .\Resize-VmTempDisk.ps1 `
-  -SubscriptionId 00000000-0000-0000-0000-000000000000 `
-  -ResourceGroupName tfvmex-resources `
-  -VMName vmtest `
+  -SubscriptionId <subscription-id> `
+  -ResourceGroupName <resource-group> `
+  -VMName <vm-name> `
   -NewSize Standard_D4ds_v5 `
   -CleanupSnapshot `
   -Confirm:$false
@@ -67,7 +67,7 @@ Default names are derived from the VM name and target size slug, e.g.:
 
 **Preview only (no changes made):**
 ```powershell
-.\Resize-VmTempDisk.ps1 -ResourceGroupName tfvmex-resources -VMName vmtest -NewSize Standard_D4ds_v5 -WhatIf
+.\Resize-VmTempDisk.ps1 -ResourceGroupName <resource-group> -VMName <vm-name> -NewSize Standard_D4ds_v5 -WhatIf
 ```
 
 ## What Is Preserved
