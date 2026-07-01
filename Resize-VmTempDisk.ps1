@@ -4,11 +4,11 @@ Resizes an Azure VM to a temp-disk-backed size by rebuilding it from a snapshot-
 
 .DESCRIPTION
 Captures the source VM configuration, snapshots the current OS disk, creates or reuses a managed
-disk from that snapshot, deletes the VM while preserving the NIC and OS resources, and recreates
+disk from that snapshot, deletes the VM while preserving NICs, OS resources, and data disks, and recreates
 the VM on the requested size using Az PowerShell cmdlets.
 
 The script is rerun-safe through a local JSON state file and preserves relevant VM properties such
-as zone, license type, marketplace plan, and Trusted Launch settings when present.
+as zone, license type, marketplace plan, Trusted Launch settings, network interfaces, and data disks when present.
 
 .PARAMETER ResourceGroupName
 Name of the Azure resource group that contains the VM.
@@ -196,12 +196,148 @@ function Wait-ForDiskSucceeded {
     throw "Timed out waiting for disk '$DiskName' to reach ProvisioningState=Succeeded."
 }
 
+function Get-DataDiskStateFromVm {
+    param($Vm)
+
+    if (-not $Vm.StorageProfile.DataDisks -or $Vm.StorageProfile.DataDisks.Count -eq 0) {
+        return @()
+    }
+
+    $disks = foreach ($dataDisk in ($Vm.StorageProfile.DataDisks | Sort-Object { [int]$_.Lun })) {
+        @{
+            Lun                     = [int]$dataDisk.Lun
+            Name                    = $dataDisk.Name
+            DiskId                  = $dataDisk.ManagedDisk.Id
+            Caching                 = Get-OptionalValue $dataDisk.Caching
+            WriteAcceleratorEnabled = if ($null -ne $dataDisk.WriteAcceleratorEnabled) { [bool]$dataDisk.WriteAcceleratorEnabled } else { $null }
+        }
+    }
+
+    return @($disks)
+}
+
+function Get-NetworkInterfaceStateFromVm {
+    param($Vm)
+
+    if (-not $Vm.NetworkProfile.NetworkInterfaces -or $Vm.NetworkProfile.NetworkInterfaces.Count -eq 0) {
+        throw 'VM has no network interfaces.'
+    }
+
+    $singleNic = $Vm.NetworkProfile.NetworkInterfaces.Count -eq 1
+    $nics = foreach ($nicRef in $Vm.NetworkProfile.NetworkInterfaces) {
+        @{
+            Id      = $nicRef.Id
+            Primary = if ($null -ne $nicRef.Primary) {
+                [bool]$nicRef.Primary
+            }
+            elseif ($singleNic) {
+                $true
+            }
+            else {
+                $false
+            }
+        }
+    }
+
+    return @($nics | Sort-Object { -not $_.Primary })
+}
+
+function Get-StateNetworkInterfaces {
+    param([hashtable]$State)
+
+    if ($State.NetworkInterfaces -and @($State.NetworkInterfaces).Count -gt 0) {
+        return @($State.NetworkInterfaces)
+    }
+
+    if ($State.NicId) {
+        return @(
+            @{
+                Id      = [string]$State.NicId
+                Primary = $true
+            }
+        )
+    }
+
+    return @()
+}
+
+function Test-VmNetworkInterfacesMatch {
+    param(
+        $Vm,
+        $ExpectedNetworkInterfaces
+    )
+
+    $expected = if ($ExpectedNetworkInterfaces) { @($ExpectedNetworkInterfaces) } else { @() }
+    $actual = if ($Vm.NetworkProfile.NetworkInterfaces) { @($Vm.NetworkProfile.NetworkInterfaces) } else { @() }
+
+    if ($expected.Count -ne $actual.Count) {
+        return $false
+    }
+
+    foreach ($expectedNic in $expected) {
+        $expectedId = [string]$expectedNic.Id
+        $actualNic = $actual | Where-Object { $_.Id -eq $expectedId } | Select-Object -First 1
+        if (-not $actualNic) {
+            return $false
+        }
+
+        if ([bool]$actualNic.Primary -ne [bool]$expectedNic.Primary) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Test-VmDataDisksMatch {
+    param(
+        $Vm,
+        $ExpectedDataDisks
+    )
+
+    $expected = if ($ExpectedDataDisks) { @($ExpectedDataDisks) } else { @() }
+    $actual = if ($Vm.StorageProfile.DataDisks) { @($Vm.StorageProfile.DataDisks) } else { @() }
+
+    if ($expected.Count -ne $actual.Count) {
+        return $false
+    }
+
+    foreach ($expectedDisk in ($expected | Sort-Object { [int]$_.Lun })) {
+        $expectedLun = [int]$expectedDisk.Lun
+        $actualDisk = $actual | Where-Object { [int]$_.Lun -eq $expectedLun } | Select-Object -First 1
+        if (-not $actualDisk) {
+            return $false
+        }
+
+        if ($actualDisk.ManagedDisk.Id -ne [string]$expectedDisk.DiskId) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Test-VmCoreMatchesTarget {
+    param(
+        $Vm,
+        [string]$ExpectedSize,
+        [string]$ExpectedDiskId
+    )
+
+    return (
+        $Vm.HardwareProfile.VmSize -eq $ExpectedSize -and
+        $Vm.StorageProfile.OsDisk.ManagedDisk.Id -eq $ExpectedDiskId
+    )
+}
+
 function CurrentVmMatchesTarget {
     param(
         [string]$ResourceGroupName,
         [string]$VMName,
         [string]$ExpectedSize,
-        [string]$ExpectedDiskId
+        [string]$ExpectedDiskId,
+        $ExpectedNetworkInterfaces,
+        $ExpectedDataDisks
     )
 
     $vm = Get-SourceVm -ResourceGroupName $ResourceGroupName -VMName $VMName
@@ -210,9 +346,158 @@ function CurrentVmMatchesTarget {
     }
 
     return (
-        $vm.HardwareProfile.VmSize -eq $ExpectedSize -and
-        $vm.StorageProfile.OsDisk.ManagedDisk.Id -eq $ExpectedDiskId
+        (Test-VmCoreMatchesTarget -Vm $vm -ExpectedSize $ExpectedSize -ExpectedDiskId $ExpectedDiskId) -and
+        (Test-VmNetworkInterfacesMatch -Vm $vm -ExpectedNetworkInterfaces $ExpectedNetworkInterfaces) -and
+        (Test-VmDataDisksMatch -Vm $vm -ExpectedDataDisks $ExpectedDataDisks)
     )
+}
+
+function Add-NetworkInterfacesToVmConfig {
+    param(
+        $VmConfig,
+        $NetworkInterfaces
+    )
+
+    $nicRefs = if ($NetworkInterfaces) { @($NetworkInterfaces) } else { @() }
+    foreach ($nicRef in ($nicRefs | Sort-Object { -not [bool]$_.Primary })) {
+        if ([bool]$nicRef.Primary) {
+            $VmConfig = Add-AzVMNetworkInterface -VM $VmConfig -Id ([string]$nicRef.Id) -Primary
+        }
+        else {
+            $VmConfig = Add-AzVMNetworkInterface -VM $VmConfig -Id ([string]$nicRef.Id)
+        }
+    }
+
+    return $VmConfig
+}
+
+function Add-DataDisksToVmConfig {
+    param(
+        $VmConfig,
+        $DataDisks
+    )
+
+    $dataDiskRefs = if ($DataDisks) { @($DataDisks) } else { @() }
+    foreach ($dataDiskRef in ($dataDiskRefs | Sort-Object { [int]$_.Lun })) {
+        $attachParams = @{
+            VM             = $VmConfig
+            Name           = [string]$dataDiskRef.Name
+            ManagedDiskId  = [string]$dataDiskRef.DiskId
+            Lun            = [int]$dataDiskRef.Lun
+            CreateOption   = 'Attach'
+        }
+
+        if ($dataDiskRef.Caching) {
+            $attachParams.Caching = [string]$dataDiskRef.Caching
+        }
+        if ($null -ne $dataDiskRef.WriteAcceleratorEnabled) {
+            $attachParams.WriteAccelerator = [bool]$dataDiskRef.WriteAcceleratorEnabled
+        }
+
+        $VmConfig = Add-AzVMDataDisk @attachParams
+    }
+
+    return $VmConfig
+}
+
+function Repair-MissingDataDisks {
+    param([hashtable]$State)
+
+    $vm = Get-SourceVm -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName
+    if (-not $vm) {
+        return $false
+    }
+
+    if (-not (Test-VmCoreMatchesTarget -Vm $vm -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId)) {
+        return $false
+    }
+
+    if (Test-VmDataDisksMatch -Vm $vm -ExpectedDataDisks $State.DataDisks) {
+        return $true
+    }
+
+    $expectedDisks = if ($State.DataDisks) { @($State.DataDisks) } else { @() }
+    $attachedLuns = @(
+        if ($vm.StorageProfile.DataDisks) {
+            $vm.StorageProfile.DataDisks | ForEach-Object { [int]$_.Lun }
+        }
+    )
+
+    foreach ($dataDiskRef in ($expectedDisks | Sort-Object { [int]$_.Lun })) {
+        if ($attachedLuns -contains [int]$dataDiskRef.Lun) {
+            continue
+        }
+
+        Write-Log "Attaching data disk '$($dataDiskRef.Name)' at LUN $($dataDiskRef.Lun)"
+        $attachParams = @{
+            VM            = $vm
+            Name          = [string]$dataDiskRef.Name
+            ManagedDiskId = [string]$dataDiskRef.DiskId
+            Lun           = [int]$dataDiskRef.Lun
+            CreateOption  = 'Attach'
+        }
+
+        if ($dataDiskRef.Caching) {
+            $attachParams.Caching = [string]$dataDiskRef.Caching
+        }
+        if ($null -ne $dataDiskRef.WriteAcceleratorEnabled) {
+            $attachParams.WriteAccelerator = [bool]$dataDiskRef.WriteAcceleratorEnabled
+        }
+
+        $vm = Add-AzVMDataDisk @attachParams
+    }
+
+    Update-AzVM -ResourceGroupName $State.ResourceGroupName -VM $vm | Out-Null
+    return (Test-VmDataDisksMatch -Vm (Get-SourceVm -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName) -ExpectedDataDisks $State.DataDisks)
+}
+
+function Repair-MissingNetworkInterfaces {
+    param([hashtable]$State)
+
+    $vm = Get-SourceVm -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName
+    if (-not $vm) {
+        return $false
+    }
+
+    if (-not (Test-VmCoreMatchesTarget -Vm $vm -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId)) {
+        return $false
+    }
+
+    $expectedNics = Get-StateNetworkInterfaces -State $State
+    if (Test-VmNetworkInterfacesMatch -Vm $vm -ExpectedNetworkInterfaces $expectedNics) {
+        return $true
+    }
+
+    $attachedNicIds = @(
+        if ($vm.NetworkProfile.NetworkInterfaces) {
+            $vm.NetworkProfile.NetworkInterfaces | ForEach-Object { $_.Id }
+        }
+    )
+
+    foreach ($nicRef in ($expectedNics | Sort-Object { -not [bool]$_.Primary })) {
+        if ($attachedNicIds -contains [string]$nicRef.Id) {
+            continue
+        }
+
+        Write-Log "Attaching network interface '$($nicRef.Id)' (Primary=$([bool]$nicRef.Primary))"
+        if ([bool]$nicRef.Primary) {
+            $vm = Add-AzVMNetworkInterface -VM $vm -Id ([string]$nicRef.Id) -Primary
+        }
+        else {
+            $vm = Add-AzVMNetworkInterface -VM $vm -Id ([string]$nicRef.Id)
+        }
+    }
+
+    Update-AzVM -ResourceGroupName $State.ResourceGroupName -VM $vm | Out-Null
+    return (Test-VmNetworkInterfacesMatch -Vm (Get-SourceVm -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName) -ExpectedNetworkInterfaces $expectedNics)
+}
+
+function Repair-MissingVmAttachments {
+    param([hashtable]$State)
+
+    $nicsOk = Repair-MissingNetworkInterfaces -State $State
+    $disksOk = Repair-MissingDataDisks -State $State
+    return ($nicsOk -and $disksOk)
 }
 
 function Get-SourceState {
@@ -238,7 +523,6 @@ function Get-SourceState {
     }
 
     $osDisk = Get-AzDisk -ResourceGroupName $ResourceGroupName -DiskName $vm.StorageProfile.OsDisk.Name
-    $nicId = $vm.NetworkProfile.NetworkInterfaces[0].Id
     $zone = $null
     if ($vm.Zones -and $vm.Zones.Count -gt 0) {
         $zone = $vm.Zones[0]
@@ -257,7 +541,7 @@ function Get-SourceState {
         OriginalOsDiskName = $osDisk.Name
         OriginalOsDiskSku = $osDisk.Sku.Name
         OriginalOsDiskStorageAccountType = $vm.StorageProfile.OsDisk.ManagedDisk.StorageAccountType
-        NicId             = $nicId
+        NetworkInterfaces = Get-NetworkInterfaceStateFromVm -Vm $vm
         Location          = $vm.Location
         Zone              = $zone
         OsType            = [string]$vm.StorageProfile.OsDisk.OsType
@@ -278,6 +562,7 @@ function Get-SourceState {
         }
         SnapshotId        = $null
         NewOsDiskId       = $null
+        DataDisks         = Get-DataDiskStateFromVm -Vm $vm
         Completed         = $false
     }
 
@@ -349,8 +634,8 @@ function Ensure-NewDisk {
 function Ensure-SourceVmRemoved {
     param([hashtable]$State)
 
-    if ($State.NewOsDiskId -and (CurrentVmMatchesTarget -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId)) {
-        Write-Log "VM already matches the requested size and recreated OS disk; skipping deletion"
+    if ($State.NewOsDiskId -and (CurrentVmMatchesTarget -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId -ExpectedNetworkInterfaces (Get-StateNetworkInterfaces -State $State) -ExpectedDataDisks $State.DataDisks)) {
+        Write-Log "VM already matches the requested size, recreated OS disk, network interfaces, and data disks; skipping deletion"
         $State.Completed = $true
         return
     }
@@ -361,12 +646,22 @@ function Ensure-SourceVmRemoved {
         return
     }
 
+    if ($State.NewOsDiskId -and (Test-VmCoreMatchesTarget -Vm $vm -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId)) {
+        Write-Log "Target VM already exists with the requested size and recreated OS disk; skipping deletion"
+        return
+    }
+
     if (-not $PSCmdlet.ShouldProcess("$($State.ResourceGroupName)/$($State.VMName)", "Delete VM after setting disk/NIC delete options to Detach")) {
         throw 'Operation cancelled.'
     }
 
     Write-Log "Setting delete options to Detach for the current VM"
     $vm.StorageProfile.OsDisk.DeleteOption = 'Detach'
+    if ($vm.StorageProfile.DataDisks) {
+        foreach ($dataDisk in $vm.StorageProfile.DataDisks) {
+            $dataDisk.DeleteOption = 'Detach'
+        }
+    }
     foreach ($nicRef in $vm.NetworkProfile.NetworkInterfaces) {
         $nicRef.DeleteOption = 'Detach'
     }
@@ -383,14 +678,20 @@ function Ensure-SourceVmRemoved {
 function New-ReplacementVm {
     param([hashtable]$State)
 
-    if (CurrentVmMatchesTarget -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId) {
-        Write-Log "Target VM already exists with the requested size and recreated OS disk"
+    if (CurrentVmMatchesTarget -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName -ExpectedSize $State.NewSize -ExpectedDiskId $State.NewOsDiskId -ExpectedNetworkInterfaces (Get-StateNetworkInterfaces -State $State) -ExpectedDataDisks $State.DataDisks) {
+        Write-Log "Target VM already exists with the requested size, recreated OS disk, network interfaces, and data disks"
         $State.Completed = $true
         return
     }
 
     $existingVm = Get-SourceVm -ResourceGroupName $State.ResourceGroupName -VMName $State.VMName
     if ($existingVm) {
+        if (Repair-MissingVmAttachments -State $State) {
+            Write-Log "Attached missing network interfaces and/or data disks to the existing target VM"
+            $State.Completed = $true
+            return
+        }
+
         throw "VM '$($State.VMName)' already exists but does not match the expected target state."
     }
 
@@ -426,7 +727,15 @@ function New-ReplacementVm {
     }
 
     $vmConfig = New-AzVMConfig @vmConfigParams
-    $vmConfig = Add-AzVMNetworkInterface -VM $vmConfig -Id $State.NicId -Primary
+    $networkInterfaces = Get-StateNetworkInterfaces -State $State
+    $nicCount = $networkInterfaces.Count
+    if ($nicCount -gt 0) {
+        Write-Log "Adding $nicCount network interface(s) to replacement VM configuration"
+        $vmConfig = Add-NetworkInterfacesToVmConfig -VmConfig $vmConfig -NetworkInterfaces $networkInterfaces
+    }
+    else {
+        throw 'State has no network interfaces to attach to the replacement VM.'
+    }
 
     if ($State.Plan) {
         $vmConfig = Set-AzVMPlan `
@@ -458,6 +767,12 @@ function New-ReplacementVm {
     }
     else {
         throw "Unsupported OS type '$($State.OsType)'."
+    }
+
+    $dataDiskCount = if ($State.DataDisks) { @($State.DataDisks).Count } else { 0 }
+    if ($dataDiskCount -gt 0) {
+        Write-Log "Adding $dataDiskCount data disk(s) to replacement VM configuration"
+        $vmConfig = Add-DataDisksToVmConfig -VmConfig $vmConfig -DataDisks $State.DataDisks
     }
 
     New-AzVM `
@@ -512,6 +827,43 @@ if (-not $StatePath) {
 $state = Load-State -Path $StatePath
 if ($state) {
     Write-Log "Loading existing state from '$StatePath'"
+    $sourceVm = Get-SourceVm -ResourceGroupName $ResourceGroupName -VMName $VMName
+    $stateUpdated = $false
+
+    if (-not $state.ContainsKey('NetworkInterfaces') -or $null -eq $state.NetworkInterfaces) {
+        if ($sourceVm) {
+            Write-Log 'State file has no network interface info; capturing NICs from the current VM'
+            $state.NetworkInterfaces = Get-NetworkInterfaceStateFromVm -Vm $sourceVm
+        }
+        elseif ($state.NicId) {
+            Write-Log 'State file has legacy NicId only; converting to NetworkInterfaces'
+            $state.NetworkInterfaces = @(
+                @{
+                    Id      = [string]$state.NicId
+                    Primary = $true
+                }
+            )
+        }
+        else {
+            $state.NetworkInterfaces = @()
+        }
+        $stateUpdated = $true
+    }
+
+    if (-not $state.ContainsKey('DataDisks') -or $null -eq $state.DataDisks) {
+        if ($sourceVm) {
+            Write-Log 'State file has no data disk info; capturing data disks from the current VM'
+            $state.DataDisks = Get-DataDiskStateFromVm -Vm $sourceVm
+        }
+        else {
+            $state.DataDisks = @()
+        }
+        $stateUpdated = $true
+    }
+
+    if ($stateUpdated) {
+        Save-State -State $state -Path $StatePath
+    }
 }
 else {
     Write-Log 'Capturing source VM state'
@@ -545,8 +897,18 @@ Write-Host ''
 Write-Host ("Resource group : {0}" -f $state.ResourceGroupName)
 Write-Host ("VM name        : {0}" -f $state.VMName)
 Write-Host ("New size       : {0}" -f $state.NewSize)
-Write-Host ("NIC            : {0}" -f $state.NicId)
+$networkInterfaces = Get-StateNetworkInterfaces -State $state
+Write-Host ("Network IFs    : {0}" -f $networkInterfaces.Count)
+foreach ($nic in ($networkInterfaces | Sort-Object { -not [bool]$_.Primary })) {
+    Write-Host ("                 Primary={0} -> {1}" -f $nic.Primary, $nic.Id)
+}
 Write-Host ("Original OS    : {0}" -f $state.OriginalOsDiskId)
 Write-Host ("New OS disk    : {0}" -f $state.NewOsDiskId)
+Write-Host ("Data disks     : {0}" -f $(if ($state.DataDisks) { @($state.DataDisks).Count } else { 0 }))
+if ($state.DataDisks) {
+    foreach ($dataDisk in ($state.DataDisks | Sort-Object { [int]$_.Lun })) {
+        Write-Host ("                 LUN {0} -> {1}" -f $dataDisk.Lun, $dataDisk.DiskId)
+    }
+}
 Write-Host ("Snapshot       : {0}" -f $state.SnapshotName)
 Write-Host ("State file     : {0}" -f $StatePath)

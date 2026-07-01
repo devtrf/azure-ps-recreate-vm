@@ -19,8 +19,8 @@ The script runs through these steps in order, saving state to a local JSON file 
 1. **Capture** — Reads the source VM's configuration and saves it to a state file
 2. **Snapshot** — Creates a snapshot of the current OS disk (`Standard_LRS`)
 3. **New disk** — Creates a new managed disk from the snapshot, matching the original SKU and zone
-4. **Delete VM** — Sets delete options to `Detach` on the NIC and OS disk, then deletes the VM
-5. **Recreate VM** — Creates the VM under the new size, attaching the new OS disk and existing NIC
+4. **Delete VM** — Sets delete options to `Detach` on all NICs, the OS disk, and data disks, then deletes the VM
+5. **Recreate VM** — Creates the VM under the new size, attaching the new OS disk, all NICs, and data disks
 6. **Cleanup** *(optional)* — Deletes the snapshot if `-CleanupSnapshot` was specified
 
 ## Rerun Safety
@@ -74,7 +74,7 @@ Default names are derived from the VM name and target size slug, e.g.:
 
 | Property | Preserved |
 |---|---|
-| Network interface (NIC) | ✅ |
+| Network interface(s) (NIC) | ✅ All NICs, including primary/secondary and public IP associations |
 | OS disk contents (via snapshot) | ✅ |
 | Availability zone | ✅ |
 | OS disk SKU | ✅ |
@@ -82,7 +82,7 @@ Default names are derived from the VM name and target size slug, e.g.:
 | Windows Server / AHUB license type | ✅ |
 | Marketplace plan (publisher/offer/SKU) | ✅ |
 | Trusted Launch (Secure Boot, vTPM) | ✅ |
-| Data disks | ❌ Reattach manually after the run |
+| Data disks | ✅ LUN, caching, and Write Accelerator settings preserved |
 | Availability set | ❌ Not compatible with resize workflow |
 | Diagnostics / extensions | ❌ Reconfigure after the run |
 
